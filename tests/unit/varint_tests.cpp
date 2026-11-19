@@ -4,6 +4,8 @@
  */
 
 #include <limits>
+#include <string>
+#include <vector>
 
 #include <eosio/tester.hpp>
 #include <eosio/datastream.hpp>
@@ -460,6 +462,86 @@ EOSIO_TEST_BEGIN(signed_int_constexpr_test)
    static_assert( sizeof(signed_int{0xf}) == 4 );
 EOSIO_TEST_END
 
+// The contract-side varint readers have to consume exactly the bytes the node's readers consume
+// (fc::raw::unpack) and produce the same value, otherwise a contract and the node read two
+// different objects out of one byte sequence. The node reads an `unsigned_int` from at most five
+// bytes (`by < 32`).
+template<typename VarInt, size_t N>
+static bool decodes_as( const uint8_t (&bytes)[N], decltype(VarInt::value) value, size_t consumed ) {
+   datastream<const char*> ds{reinterpret_cast<const char*>(bytes), N};
+   VarInt vi{};
+   ds >> vi;
+   return vi.value == value && ds.tellp() == consumed;
+}
+
+EOSIO_TEST_BEGIN(unsigned_int_decode_bound_test)
+   // Canonical encodings
+   { const uint8_t b[] = {0x00, 0xaa};                               CHECK_EQUAL( decodes_as<unsigned_int>(b, 0u, 1), true ) }
+   { const uint8_t b[] = {0x7f, 0xaa};                               CHECK_EQUAL( decodes_as<unsigned_int>(b, 127u, 1), true ) }
+   { const uint8_t b[] = {0x80, 0x01, 0xaa};                         CHECK_EQUAL( decodes_as<unsigned_int>(b, 128u, 2), true ) }
+   { const uint8_t b[] = {0xff, 0xff, 0xff, 0xff, 0x0f, 0xaa};       CHECK_EQUAL( decodes_as<unsigned_int>(b, u32max, 5), true ) }
+
+   // Padded (non-minimal) encodings within five bytes: accepted, as the node accepts them
+   { const uint8_t b[] = {0x80, 0x00, 0xaa};                         CHECK_EQUAL( decodes_as<unsigned_int>(b, 0u, 2), true ) }
+   { const uint8_t b[] = {0x81, 0x80, 0x80, 0x80, 0x00, 0xaa};       CHECK_EQUAL( decodes_as<unsigned_int>(b, 1u, 5), true ) }
+
+   // Over-long encodings: the fifth byte ends the value even with its continuation bit set
+   { const uint8_t b[] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x00};       CHECK_EQUAL( decodes_as<unsigned_int>(b, 0u, 5), true ) }
+   { const uint8_t b[] = {0x81, 0x80, 0x80, 0x80, 0x80, 0x7f, 0x7f}; CHECK_EQUAL( decodes_as<unsigned_int>(b, 1u, 5), true ) }
+   { const uint8_t b[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}; CHECK_EQUAL( decodes_as<unsigned_int>(b, u32max, 5), true ) }
+
+   // High bits of the fifth byte do not fit in 32 bits and are dropped
+   { const uint8_t b[] = {0xff, 0xff, 0xff, 0xff, 0x7f, 0xaa};       CHECK_EQUAL( decodes_as<unsigned_int>(b, u32max, 5), true ) }
+   { const uint8_t b[] = {0x80, 0x80, 0x80, 0x80, 0x70, 0xaa};       CHECK_EQUAL( decodes_as<unsigned_int>(b, 0u, 5), true ) }
+
+   // End of input: the fifth byte may be the last one, fewer than five unterminated bytes may not
+   { const uint8_t b[] = {0x80, 0x80, 0x80, 0x80, 0x80};             CHECK_EQUAL( decodes_as<unsigned_int>(b, 0u, 5), true ) }
+   {
+      static const uint8_t b[] = {0x80, 0x80, 0x80, 0x80};
+      CHECK_ASSERT( "get", ([]() {
+         datastream<const char*> ds{reinterpret_cast<const char*>(b), sizeof(b)};
+         unsigned_int vi{};
+         ds >> vi;
+      }) )
+   }
+
+   // Length prefixes are read through unsigned_int, so the content follows the fifth byte
+   {
+      const uint8_t b[] = {0x82, 0x80, 0x80, 0x80, 0x80, 0x68, 0x69, 0x21};
+      datastream<const char*> ds{reinterpret_cast<const char*>(b), sizeof(b)};
+      std::string s;
+      ds >> s;
+      CHECK_EQUAL( s == "hi", true )
+      CHECK_EQUAL( ds.tellp(), 7 )
+   }
+   {
+      const uint8_t b[] = {0x81, 0x80, 0x80, 0x80, 0x80, 0x41, 0x42};
+      datastream<const char*> ds{reinterpret_cast<const char*>(b), sizeof(b)};
+      std::vector<char> v;
+      ds >> v;
+      CHECK_EQUAL( v.size(), 1 )
+      CHECK_EQUAL( v[0], 0x41 )
+      CHECK_EQUAL( ds.tellp(), 6 )
+   }
+EOSIO_TEST_END
+
+// The node reads a `signed_int` (ABI `varint32`) without a bound, so this reader has none either:
+// an over-long encoding is consumed to its terminating byte.
+EOSIO_TEST_BEGIN(signed_int_decode_test)
+   // Canonical encodings (zig-zag)
+   { const uint8_t b[] = {0x00, 0xaa};                               CHECK_EQUAL( decodes_as<signed_int>(b, 0, 1), true ) }
+   { const uint8_t b[] = {0x01, 0xaa};                               CHECK_EQUAL( decodes_as<signed_int>(b, -1, 1), true ) }
+   { const uint8_t b[] = {0x80, 0x01, 0xaa};                         CHECK_EQUAL( decodes_as<signed_int>(b, 64, 2), true ) }
+   { const uint8_t b[] = {0xfe, 0xff, 0xff, 0xff, 0x0f, 0xaa};       CHECK_EQUAL( decodes_as<signed_int>(b, i32max, 5), true ) }
+   { const uint8_t b[] = {0xff, 0xff, 0xff, 0xff, 0x0f, 0xaa};       CHECK_EQUAL( decodes_as<signed_int>(b, i32min, 5), true ) }
+
+   // Padded within five bytes
+   { const uint8_t b[] = {0x80, 0x00, 0xaa};                         CHECK_EQUAL( decodes_as<signed_int>(b, 0, 2), true ) }
+
+   // Over-long: the sixth byte belongs to the value, as on the node
+   { const uint8_t b[] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0xaa}; CHECK_EQUAL( decodes_as<signed_int>(b, 0, 6), true ) }
+EOSIO_TEST_END
+
 int main(int argc, char* argv[]) {
    bool verbose = false;
    if( argc >= 2 && std::strcmp( argv[1], "-v" ) == 0 ) {
@@ -471,5 +553,7 @@ int main(int argc, char* argv[]) {
    EOSIO_TEST(signed_int_type_test);
    EOSIO_TEST(unsigned_int_constexpr_test);
    EOSIO_TEST(signed_int_constexpr_test);
+   EOSIO_TEST(unsigned_int_decode_bound_test);
+   EOSIO_TEST(signed_int_decode_test);
    return has_failed();
 }
