@@ -15,7 +15,7 @@ project(cdt)
 
 set(VERSION_MAJOR 4)
 set(VERSION_MINOR 1)
-set(VERSION_PATCH 1wax01)
+set(VERSION_PATCH 1wax02)
 # set(VERSION_SUFFIX "") 
 
 if (VERSION_SUFFIX)
