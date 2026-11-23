@@ -216,6 +216,15 @@ namespace eosio {
        /**
         *  Deserialize an unsigned_int object
         *
+        *  Reads at most five bytes, the most a 32-bit value needs: the fifth byte ends the value
+        *  whether or not its continuation bit is set, and its bits above the 32nd are dropped.
+        *  This is exactly what the node does (`fc::raw::unpack` for `fc::unsigned_int`), so a
+        *  contract and the node consume the same bytes and read the same value from any input.
+        *
+        *  Like the node, it accepts encodings that are not minimal: several byte sequences decode
+        *  to one value. A contract that authorises or identifies an object by its bytes still has
+        *  to compare them with its own re-encoding.
+        *
         *  @param ds - The stream to read
         *  @param vi - The destination for deserialized value
         *  @tparam DataStream - Type of datastream
@@ -228,7 +237,7 @@ namespace eosio {
             ds.get(b);
             v |= uint32_t(uint8_t(b) & 0x7f) << by;
             by += 7;
-         } while( uint8_t(b) & 0x80 );
+         } while( (uint8_t(b) & 0x80) && by < 32 );
          vi.value = static_cast<uint32_t>(v);
          return ds;
        }
@@ -442,6 +451,10 @@ namespace eosio {
 
        /**
         *  Deserialize an signed_int object
+        *
+        *  Follows continuation bits without a bound, unlike unsigned_int. That is deliberate: the
+        *  node's reader for `fc::signed_int` (the ABI type `varint32`) is unbounded too, and the two
+        *  have to consume the same bytes. Bound this reader only together with the node's.
         *
         *  @param ds - The stream to read
         *  @param vi - The destination for deserialized value
